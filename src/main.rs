@@ -4,12 +4,14 @@ use bitcoin::{
     absolute::LockTime,
     consensus::encode::serialize_hex,
     key::{Keypair, Secp256k1, TapTweak, TweakedKeypair, UntweakedPublicKey},
+    opcodes::all::OP_CHECKSIG,
+    script::Builder,
     secp256k1::Message,
     sighash::{Prevouts, SighashCache},
-    taproot::{Signature, TaprootBuilder},
+    taproot::{LeafVersion, Signature, TaprootBuilder},
     transaction::Version,
-    Address, Amount, CompressedPublicKey, KnownHrp, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-    Txid, Witness,
+    Address, Amount, KnownHrp, ScriptBuf, Sequence, TapLeafHash, Transaction, TxIn, TxOut, Txid,
+    Witness,
 };
 
 fn main() {
@@ -41,20 +43,24 @@ fn main() {
     )
     .unwrap();
 
-    let script1 = CompressedPublicKey::from_slice(&key1.public_key().serialize())
-        .unwrap()
-        .p2wpkh_script_code();
-    let script2 = CompressedPublicKey::from_slice(&key2.public_key().serialize())
-        .unwrap()
-        .p2wpkh_script_code();
-    let script3 = CompressedPublicKey::from_slice(&key3.public_key().serialize())
-        .unwrap()
-        .p2wpkh_script_code();
+    // pushing x-only-pubkey because OP_CHECKSIG in tapscript uses 32-byte public keys.
+    let script1 = Builder::new()
+        .push_x_only_key(&key1.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+    let script2 = Builder::new()
+        .push_x_only_key(&key2.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+    let script3 = Builder::new()
+        .push_x_only_key(&key3.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
 
     let builder = TaprootBuilder::new();
-    let builder = builder.add_leaf(1, script1).unwrap();
-    let builder = builder.add_leaf(2, script2).unwrap();
-    let builder = builder.add_leaf(2, script3).unwrap();
+    let builder = builder.add_leaf(1, script1.clone()).unwrap();
+    let builder = builder.add_leaf(2, script2.clone()).unwrap();
+    let builder = builder.add_leaf(2, script3.clone()).unwrap();
 
     let tap_tree = builder.finalize(&secp, internal_key.0).unwrap();
 
@@ -67,6 +73,14 @@ fn main() {
 
     println!("taproot address: {}", taproot_address);
 
+    let address_to_send = Address::from_str("bcrt1qd75p224rk59gq20nfupurgq07ga5kjskvfjcpm")
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap();
+
+    let sighash_type = bitcoin::TapSighashType::Default;
+
+    /* KEY PATH SPEND */
     let tx_input = TxIn {
         previous_output: bitcoin::OutPoint {
             txid: Txid::from_str(
@@ -79,11 +93,6 @@ fn main() {
         sequence: Sequence(0),
         witness: Witness::default(),
     };
-
-    let address_to_send = Address::from_str("bcrt1qd75p224rk59gq20nfupurgq07ga5kjskvfjcpm")
-        .unwrap()
-        .require_network(bitcoin::Network::Regtest)
-        .unwrap();
 
     let send_output = TxOut {
         value: Amount::from_btc(0.05).unwrap(),
@@ -112,8 +121,6 @@ fn main() {
     let prevout = vec![utxo];
     let prevout = Prevouts::All(&prevout);
 
-    let sighash_type = bitcoin::TapSighashType::Default;
-
     let mut sighasher = SighashCache::new(&mut unsigned_tx);
     let sighash = sighasher
         .taproot_key_spend_signature_hash(0, &prevout, sighash_type)
@@ -133,4 +140,83 @@ fn main() {
 
     println!("{:#?}", tx);
     println!("raw transaction: {}", serialize_hex(tx));
+
+    /* KEY PATH SPEND */
+
+    /* SCRIPT PATH SPEND */
+    let tx_input = TxIn {
+        previous_output: bitcoin::OutPoint {
+            txid: Txid::from_str(
+                "878e7be2a1be507a86887973ff90f00ba3eaa6fadfafebf407d9d9d89e35ae5f",
+            )
+            .unwrap(),
+            vout: 0,
+        },
+        script_sig: ScriptBuf::default(),
+        sequence: Sequence(0),
+        witness: Witness::default(),
+    };
+
+    let send_output = TxOut {
+        value: Amount::from_btc(0.035).unwrap(),
+        script_pubkey: address_to_send.script_pubkey(),
+    };
+
+    let change_output = TxOut {
+        value: Amount::from_btc(0.01).unwrap(),
+        script_pubkey: taproot_address.script_pubkey(),
+    };
+
+    let mut unsigned_tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![tx_input],
+        output: vec![send_output, change_output],
+    };
+
+    let utxo = TxOut {
+        value: Amount::from_btc(0.04882812).unwrap(),
+        script_pubkey: ScriptBuf::from_hex(
+            "51204dc0f1988094929d5212ad9062232d937bfc1effd6c2b90cd49c34af0a066e7c",
+        )
+        .unwrap(),
+    };
+    let prevouts = vec![utxo];
+    let prevouts = Prevouts::All(&prevouts);
+
+    let leaf_hash = TapLeafHash::from_script(
+        script1.as_script(),
+        bitcoin::taproot::LeafVersion::TapScript,
+    );
+
+    let mut sighasher = SighashCache::new(&mut unsigned_tx);
+    let sighash = sighasher
+        .taproot_script_spend_signature_hash(0, &prevouts, leaf_hash, sighash_type)
+        .unwrap();
+
+    let msg = Message::from_digest_slice(sighash.as_ref()).unwrap();
+    let signature = secp.sign_schnorr(&msg, &key1);
+
+    let signature = Signature {
+        signature,
+        sighash_type,
+    };
+
+    let control_block = tap_tree
+        .control_block(&(script1.clone(), LeafVersion::TapScript))
+        .unwrap()
+        .serialize();
+
+    let mut witness = Witness::new();
+    witness.push(signature.to_vec());
+    witness.push(script1.as_bytes());
+    witness.push(control_block);
+
+    *sighasher.witness_mut(0).unwrap() = witness;
+    let tx = sighasher.into_transaction();
+
+    println!("{:#?}", tx);
+    println!("script path spend raw transaction: {}", serialize_hex(tx));
+
+    /* SCRIPT PATH SPEND */
 }
